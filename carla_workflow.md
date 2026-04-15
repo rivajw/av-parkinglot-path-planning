@@ -107,7 +107,10 @@ Now, we can run python script we designed for camera view defined by ourselves.
 ssh jiaweis2@ece000.ece.local.cmu.edu
 source /scratch/jiaweis2/miniconda3/etc/profile.d/conda.sh
 conda activate carla37
-python /scratch/jiaweis2/web_view.py
+python /scratch/jiaweis2/scripts/web_view.py
+
+# if encounter problem: No module named 'cv2', run the following
+python -m pip install flask opencv-python-headless numpy
 ```
 
 ### Terminal 3:
@@ -231,7 +234,7 @@ CARLA towns are prebuilt Unreal maps, so they don’t appear as a downloadable 2
 
 We need to load Town05 to carla first:
 ```shell
-python /scratch/jiaweis2/town05.py
+python /scratch/jiaweis2/scripts/town05.py
 ```
 This is a one time utility script to load Town05. We still need `web_view.py` for connection and display purpose.
 
@@ -266,6 +269,15 @@ These have:
 So these are the “real” cars in the simulation.
 
 ## Static Obstacles
+
+To get the occupancy grid, run 
+```shell
+# first time, create target directory
+mkdir /scratch/jiaweis2/occupancy_grid
+
+python /scratch/jiaweis2/scripts/occupancy_grid.py 
+```
+
 Static vehicle-like map objects are not live actors, but they are also not just raw pixels from the image.
 
 They are scene objects baked into the Town05 map, and CARLA can sometimes expose them through semantic map queries like:
