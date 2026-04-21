@@ -35,7 +35,8 @@ STREAM_PORT = 5000
 MAP_NAME = "Town05"
 
 GRID_RES = 0.5
-INFLATION_RADIUS_M = 0.5
+EGO_CLEARANCE_MARGIN_M = 0.20
+INFLATION_RADIUS_M = None
 
 FREE = 0
 OCCUPIED = 1
@@ -232,86 +233,6 @@ def draw_rotated_box(grid, cx, cy, yaw_rad, hl, hw, ox, oy, val):
                 grid[gy, gx] = val
 
 
-# =========================
-# SEMANTIC GRID BUILD
-# =========================
-# def _mark_semantic_drivable(world, sem_grid):
-#     carla_map = world.get_map()
-#     lane_mask = carla.LaneType.Driving | carla.LaneType.Parking
-
-#     for gy in range(GRID_H):
-#         for gx in range(GRID_W):
-#             wx, wy = grid_to_world(gx, gy, ORIGIN_X, ORIGIN_Y)
-#             loc = carla.Location(x=wx, y=wy, z=0.5)
-#             wp = carla_map.get_waypoint(loc, project_to_road=False, lane_type=lane_mask)
-#             if wp is not None:
-#                 sem_grid[gy, gx] = SEM_DRIVABLE
-
-
-# def build_semantic_grid(world, ego_vehicle):
-#     sem = np.zeros((GRID_H, GRID_W), dtype=np.uint8)
-
-#     # 1) drivable / parking cells
-#     _mark_semantic_drivable(world, sem)
-
-#     # 2) static map vehicles
-#     static_labels = [
-#         carla.CityObjectLabel.Car,
-#         carla.CityObjectLabel.Truck,
-#         carla.CityObjectLabel.Bus,
-#         carla.CityObjectLabel.Motorcycle,
-#         carla.CityObjectLabel.Bicycle,
-#     ]
-#     for label in static_labels:
-#         try:
-#             bbs = world.get_level_bbs(label)
-#             bbs = [bb for bb in bbs if bbox_center_in_lot(bb)]
-#             for bb in bbs:
-#                 _rasterize_bbox_semantic(sem, bb.location, bb.extent, SEM_STATIC_CAR)
-#         except Exception as e:
-#             print(f"[SEM] Could not query {label}: {e}")
-
-#     # 3) dynamic vehicles except ego
-#     for actor in world.get_actors().filter("vehicle.*"):
-#         if actor.id == ego_vehicle.id:
-#             continue
-#         at = actor.get_transform()
-#         bb = actor.bounding_box
-#         draw_rotated_box(
-#             sem,
-#             at.location.x,
-#             at.location.y,
-#             math.radians(at.rotation.yaw),
-#             bb.extent.x + 0.2,
-#             bb.extent.y + 0.2,
-#             ORIGIN_X,
-#             ORIGIN_Y,
-#             SEM_DYNAMIC_CAR
-#         )
-
-#     try:
-#         global road_line_bbs_cache
-
-#         road_line_bbs = world.get_level_bbs(carla.CityObjectLabel.RoadLines)
-#         road_line_bbs = [bb for bb in road_line_bbs if bbox_center_in_lot(bb)]
-#         road_line_bbs_cache = road_line_bbs
-
-#         print(f"[SEM] Road-line bboxes in lot: {len(road_line_bbs)}")
-#         for bb in road_line_bbs:
-#             _rasterize_bbox_semantic(
-#                 sem,
-#                 bb.location,
-#                 bb.extent,
-#                 SEM_ROAD_LINE,
-#                 shrink_x=0.12,
-#                 shrink_y=0.12
-#             )
-#     except Exception as e:
-#         print(f"[SEM] Could not query road lines: {e}")
-
-#     return sem
-
-
 def build_nav_grid_from_semantics(sem):
     """
     Navigation grid:
@@ -320,13 +241,6 @@ def build_nav_grid_from_semantics(sem):
     - parking lines are LINE_OCCUPIED (blocked, but not inflated)
     """
     nav = np.full((GRID_H, GRID_W), FREE, dtype=np.uint8)
-
-    # # hard obstacles that should be inflated
-    # nav[sem == SEM_STATIC_CAR] = OCCUPIED
-    # nav[sem == SEM_DYNAMIC_CAR] = OCCUPIED
-
-    # # painted parking lines: blocked, but no inflation
-    # nav[sem == SEM_ROAD_LINE] = LINE_OCCUPIED
 
     # hard obstacles that should be inflated
     nav[sem == STATIC_CAR] = OCCUPIED
@@ -558,6 +472,35 @@ def choose_random_empty_slot(slots):
 # =========================
 # A*
 # =========================
+
+def local_clearance_penalty(grid, gx, gy, radius_cells):
+    if grid[gy, gx] != FREE:
+        return 0.0
+
+    best_d2 = None
+
+    y0 = max(0, gy - radius_cells)
+    y1 = min(GRID_H, gy + radius_cells + 1)
+    x0 = max(0, gx - radius_cells)
+    x1 = min(GRID_W, gx + radius_cells + 1)
+
+    for ny in range(y0, y1):
+        for nx in range(x0, x1):
+            if grid[ny, nx] in (OCCUPIED, INFLATED):
+                d2 = (gx - nx) ** 2 + (gy - ny) ** 2
+                if best_d2 is None or d2 < best_d2:
+                    best_d2 = d2
+
+    if best_d2 is None:
+        return 0.0
+
+    if best_d2 <= 1:
+        return 1
+    elif best_d2 <= 4:
+        return 0.25
+    else:
+        return 0.0
+    
 def astar(grid, start, goal):
     moves = [
         (-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
@@ -590,7 +533,9 @@ def astar(grid, start, goal):
             if grid[nb[1], nb[0]] in (OCCUPIED, INFLATED, LINE_OCCUPIED):
                 continue
 
-            tg = cg + step_cost
+            # tg = cg + step_cost
+            clearance_pen = local_clearance_penalty(grid, nb[0], nb[1], radius_cells=3)
+            tg = cg + step_cost + clearance_pen
             if tg < g_cost.get(nb, 1e18):
                 g_cost[nb] = tg
                 came_from[nb] = cur
@@ -639,7 +584,9 @@ def plan(grid, start_xy, goal_xy):
     if not gf:
         raise RuntimeError("No free goal cell near target")
 
+    print("[PLAN] running A*...")
     path = astar(grid, sf, gf)
+    print("[PLAN] A* done")
     if not path:
         raise RuntimeError("A* found no path")
 
@@ -764,6 +711,20 @@ vehicle.set_simulate_physics(True)
 vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=0.0))
 time.sleep(1.0)
 
+# compute inflation margin to match the ego vehicle size
+ego_bb = vehicle.bounding_box
+
+# CARLA bbox extents are half-dimensions
+ego_half_width_m = ego_bb.extent.y
+ego_half_length_m = ego_bb.extent.x
+
+# Inflate obstacles by ego half-width + a small buffer
+INFLATION_RADIUS_M = max(0.5, ego_half_width_m + EGO_CLEARANCE_MARGIN_M)
+
+print(f"[EGO] half width = {ego_half_width_m:.2f} m")
+print(f"[EGO] half length = {ego_half_length_m:.2f} m")
+print(f"[GRID] inflation radius = {INFLATION_RADIUS_M:.2f} m")
+
 t = vehicle.get_transform()
 ego_x, ego_y = t.location.x, t.location.y
 print(f"Spawned at ({ego_x:.2f}, {ego_y:.2f})")
@@ -777,141 +738,6 @@ draw_label(world, ego_x, ego_y, "START", carla.Color(0, 255, 0))
 # =========================
 # slots_data = build_fixed_slots()
 slots_data = []
-
-# def refresh_semantics_and_nav():
-#     global semantic_grid, nav_grid, inflated_grid, slots_data
-
-#     print("[GRID] Building semantic grid from CARLA world data…")
-#     semantic_grid = build_semantic_grid(world, vehicle)
-
-#     update_slot_occupancy(semantic_grid, slots_data)
-#     n_occ = sum(1 for s in slots_data if s["occupied"])
-#     n_free = sum(1 for s in slots_data if not s["occupied"])
-#     print(f"[SLOT] total={len(slots_data)} free={n_free} occupied={n_occ}")
-
-#     nav_grid = build_nav_grid_from_semantics(semantic_grid)
-#     inflated_grid = inflate(nav_grid, INFLATION_RADIUS_M)
-#     print(f"[GRID] Inflated occupied cells: {int(np.sum(inflated_grid != FREE))}")
-
-# def _cluster_vals(vals, tol):
-#     if not vals:
-#         return []
-#     vals = sorted(vals)
-#     groups = [[vals[0]]]
-#     for v in vals[1:]:
-#         if abs(v - np.mean(groups[-1])) <= tol:
-#             groups[-1].append(v)
-#         else:
-#             groups.append([v])
-#     return groups
-
-
-# def _build_slots_from_roadlines(road_line_bbs):
-#     """
-#     Build slot rectangles from filtered RoadLines bboxes returned by occupancy_grid.py.
-
-#     Strategy:
-#     - separate vertical-ish and horizontal-ish line boxes
-#     - cluster horizontal lines into parking rows
-#     - cluster vertical separators into x positions
-#     - neighboring vertical separators define slot width
-#     - horizontal row position defines upper/lower slot bands
-#     """
-#     vertical = []
-#     horizontal = []
-
-#     for bb in road_line_bbs:
-#         w = bb.extent.x * 2.0
-#         h = bb.extent.y * 2.0
-
-#         # long horizontal row lines
-#         if w > h * 2.0:
-#             horizontal.append(bb)
-#         # short / tall separators
-#         elif h > w * 1.2:
-#             vertical.append(bb)
-
-#     if not horizontal or not vertical:
-#         print("[SLOT] No usable road-line geometry found")
-#         return []
-
-#     # cluster horizontal row lines by y
-#     h_y_groups = _cluster_vals([bb.location.y for bb in horizontal], tol=2.0)
-#     row_y_centers = sorted(float(np.mean(g)) for g in h_y_groups)
-
-#     # cluster vertical separator x positions
-#     v_x_groups = _cluster_vals([bb.location.x for bb in vertical], tol=0.8)
-#     x_centers = sorted(float(np.mean(g)) for g in v_x_groups)
-
-#     print("[SLOT] row_y_centers:", [round(v, 2) for v in row_y_centers])
-#     print("[SLOT] x_centers:", [round(v, 2) for v in x_centers])
-
-#     slots = []
-#     slot_id = 0
-
-#     # pair neighboring horizontal row centers as [top row line, bottom row line]
-#     # For Town05 lot, each parking band has 3 horizontal lines:
-#     # top separator line, aisle center line, bottom separator line.
-#     # We treat consecutive groups around the aisle.
-#     for i in range(0, len(row_y_centers) - 2, 3):
-#         y_top = row_y_centers[i]
-#         y_mid = row_y_centers[i + 1]
-#         y_bot = row_y_centers[i + 2]
-
-#         # top side slots: between y_mid and y_top
-#         # bottom side slots: between y_bot and y_mid
-#         for j in range(len(x_centers) - 1):
-#             x_left = x_centers[j]
-#             x_right = x_centers[j + 1]
-#             width = x_right - x_left
-
-#             # ignore giant gaps / tiny gaps
-#             if width < 2.0 or width > 4.5:
-#                 continue
-
-#             # top slot
-#             gx0, gy0 = world_to_grid(x_left + 0.15, y_mid + 0.15, ORIGIN_X, ORIGIN_Y)
-#             gx1, gy1 = world_to_grid(x_right - 0.15, y_top - 0.15, ORIGIN_X, ORIGIN_Y)
-#             gx0, gx1 = sorted([gx0, gx1])
-#             gy0, gy1 = sorted([gy0, gy1])
-
-#             if in_bounds(gx0, gy0) and in_bounds(gx1, gy1):
-#                 cx, cy = grid_to_world(0.5 * (gx0 + gx1), 0.5 * (gy0 + gy1), ORIGIN_X, ORIGIN_Y)
-#                 ax, ay = grid_to_world(0.5 * (gx0 + gx1), world_to_grid(cx, y_mid - 1.0, ORIGIN_X, ORIGIN_Y)[1], ORIGIN_X, ORIGIN_Y)
-
-#                 slots.append({
-#                     "id": slot_id,
-#                     "gx0": gx0, "gx1": gx1,
-#                     "gy0": gy0, "gy1": gy1,
-#                     "cx": cx, "cy": cy,
-#                     "approach_x": cx, "approach_y": y_mid - 1.0,
-#                     "yaw": 90.0,
-#                     "occupied": False,
-#                 })
-#                 slot_id += 1
-
-#             # bottom slot
-#             gx0, gy0 = world_to_grid(x_left + 0.15, y_bot + 0.15, ORIGIN_X, ORIGIN_Y)
-#             gx1, gy1 = world_to_grid(x_right - 0.15, y_mid - 0.15, ORIGIN_X, ORIGIN_Y)
-#             gx0, gx1 = sorted([gx0, gx1])
-#             gy0, gy1 = sorted([gy0, gy1])
-
-#             if in_bounds(gx0, gy0) and in_bounds(gx1, gy1):
-#                 cx, cy = grid_to_world(0.5 * (gx0 + gx1), 0.5 * (gy0 + gy1), ORIGIN_X, ORIGIN_Y)
-
-#                 slots.append({
-#                     "id": slot_id,
-#                     "gx0": gx0, "gx1": gx1,
-#                     "gy0": gy0, "gy1": gy1,
-#                     "cx": cx, "cy": cy,
-#                     "approach_x": cx, "approach_y": y_mid + 1.0,
-#                     "yaw": -90.0,
-#                     "occupied": False,
-#                 })
-#                 slot_id += 1
-
-#     print(f"[SLOT] slots built from road lines: {len(slots)}")
-#     return slots
 
 def _cluster_consecutive(indices, max_gap=1):
     """
@@ -1078,25 +904,6 @@ def _build_slots_from_roadlines(semantic_grid):
 
     print(f"[SLOT] slots built from road lines: {len(slots)}")
     return slots
-
-# def refresh_semantics_and_nav():
-#     global semantic_grid, nav_grid, inflated_grid, slots_data
-
-#     print("[GRID] Building semantic grid from occupancy_grid.py ...")
-#     semantic_grid = build_semantic_grid_truth(
-#         world,
-#         include_dynamic=True,
-#         ego_actor_id=vehicle.id
-#     )
-
-#     update_slot_occupancy(semantic_grid, slots_data)
-#     n_occ = sum(1 for s in slots_data if s["occupied"])
-#     n_free = sum(1 for s in slots_data if not s["occupied"])
-#     print(f"[SLOT] total={len(slots_data)} free={n_free} occupied={n_occ}")
-
-#     nav_grid = build_nav_grid_from_semantics(semantic_grid)
-#     inflated_grid = inflate(nav_grid, INFLATION_RADIUS_M)
-#     print(f"[GRID] Inflated occupied cells: {int(np.sum(inflated_grid != FREE))}")
 
 def refresh_semantics_and_nav():
     global semantic_grid, nav_grid, inflated_grid, slots_data, road_line_bbs_cache
