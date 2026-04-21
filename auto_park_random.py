@@ -360,7 +360,6 @@ def choose_random_empty_slot(slots):
 # =========================
 # A*
 # =========================
-
 def local_clearance_penalty(grid, gx, gy, radius_cells):
     if grid[gy, gx] != FREE:
         return 0.0
@@ -524,37 +523,62 @@ def yaw_to_unit_vec(yaw_deg):
     r = math.radians(yaw_deg)
     return math.cos(r), math.sin(r)
 
-def slot_frame_errors(vehicle, slot):
+def compute_pre_entry_point(slot, offset_m=1.0):
+    """
+    Point just OUTSIDE the selected slot, on the aisle side.
+
+    We compute the slot mouth from the slot rectangle boundary first,
+    then move a little farther outward into the aisle.
+    This guarantees the pre-entry point is outside the slot, not inside it.
+    """
+    fx, fy = yaw_to_unit_vec(slot["yaw"])
+
+    # slot rectangle size in world meters
+    slot_len_m = (slot["gx1"] - slot["gx0"] + 1) * GRID_RES
+    half_len_m = 0.5 * slot_len_m
+
+    # from slot center, go to the aisle-side boundary,
+    # then continue a bit farther into the road
+    px = slot["cx"] - (half_len_m + offset_m) * fx
+    py = slot["cy"] - (half_len_m + offset_m) * fy
+    return px, py
+
+def compute_final_parking_target(slot, stop_short_m=0.55):
+    """
+    Final center target inside the slot, but slightly short of the geometric slot center.
+    This prevents the car center from going too deep into the slot.
+    """
+    fx, fy = yaw_to_unit_vec(slot["yaw"])
+    tx = slot["cx"] - stop_short_m * fx
+    ty = slot["cy"] - stop_short_m * fy
+    return tx, ty
+
+def slot_frame_errors(vehicle, slot, target_xy=None):
     """
     Compute ego error in the slot frame.
 
-    forward_err:
-        distance from ego center to slot center along slot axis.
-        Positive means slot center is ahead of the car along slot direction.
-
-    lateral_err:
-        signed sideways offset from slot axis.
-        Positive/negative means ego is left/right of slot axis.
-
-    yaw_err:
-        ego yaw error relative to slot yaw.
+    If target_xy is given, use that point as the final stopping target
+    instead of the geometric slot center.
     """
     tf = vehicle.get_transform()
     cx, cy, yaw = tf.location.x, tf.location.y, tf.rotation.yaw
 
-    sx, sy = slot["cx"], slot["cy"]
+    if target_xy is None:
+        sx, sy = slot["cx"], slot["cy"]
+    else:
+        sx, sy = target_xy
+
     dx = sx - cx
     dy = sy - cy
 
-    fx, fy = yaw_to_unit_vec(slot["yaw"])          # slot forward axis
-    lx, ly = -fy, fx                               # slot lateral axis
+    fx, fy = yaw_to_unit_vec(slot["yaw"])
+    lx, ly = -fy, fx
 
     forward_err = dx * fx + dy * fy
     lateral_err = dx * lx + dy * ly
     yaw_err = normalize_angle_deg(slot["yaw"] - yaw)
 
     return forward_err, lateral_err, yaw_err
-
 
 def clear_selected_slot_corridor(work_grid, slot, extra_front_cells=2, half_width_pad=1):
     """
@@ -626,50 +650,80 @@ def align_to_slot_yaw(vehicle, target_yaw, timeout=8.0):
     vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0))
     return False
 
+def compute_reachable_pre_entry_point(slot, grid):
+    """
+    Find a pre-entry point outside the slot that is actually free/reachable in the aisle.
+    Try progressively farther points along the outward slot direction, then snap to nearest free.
+    """
+    fx, fy = yaw_to_unit_vec(slot["yaw"])
+
+    # slot depth in meters from raw grid
+    slot_len_m = (slot["gx1"] - slot["gx0"] + 1) * GRID_RES
+    half_len_m = 0.5 * slot_len_m
+
+    # try a few outward offsets from the slot mouth
+    for extra_m in [0.8, 1.2, 1.6, 2.0, 2.5]:
+        px = slot["cx"] - (half_len_m + extra_m) * fx
+        py = slot["cy"] - (half_len_m + extra_m) * fy
+
+        gx, gy = world_to_grid(px, py, ORIGIN_X, ORIGIN_Y)
+        free_cell = nearest_free(grid, gx, gy, r=8)
+        if free_cell is not None:
+            wx, wy = grid_to_world(free_cell[0], free_cell[1], ORIGIN_X, ORIGIN_Y)
+            return wx, wy
+
+    # fallback: return geometric point if nothing nearby is free
+    px = slot["cx"] - (half_len_m + 2.5) * fx
+    py = slot["cy"] - (half_len_m + 2.5) * fy
+    return px, py
+
 
 def drive_straight_into_slot(vehicle, slot, timeout=10.0):
     """
-    Enter the chosen slot along the slot axis.
-    This uses slot-frame errors, not direct 'aim at slot center'.
+    Enter the chosen slot along the slot axis, but stop slightly short of
+    the slot center to avoid over-parking.
     """
     deadline = time.time() + timeout
+    target_xy = compute_final_parking_target(slot, stop_short_m=0.55)
 
     while time.time() < deadline:
         tf = vehicle.get_transform()
         sp = get_speed(vehicle)
 
-        forward_err, lateral_err, yaw_err = slot_frame_errors(vehicle, slot)
+        forward_err, lateral_err, yaw_err = slot_frame_errors(vehicle, slot, target_xy=target_xy)
 
-        # overall center distance only for debug / final stopping
-        dist = math.hypot(tf.location.x - slot["cx"], tf.location.y - slot["cy"])
+        # debug distance to chosen stopping target
+        dist = math.hypot(tf.location.x - target_xy[0], tf.location.y - target_xy[1])
 
-        # success: centered enough and oriented enough
-        if abs(forward_err) < 0.35 and abs(lateral_err) < 0.25 and abs(yaw_err) < 8.0 and sp < 0.2:
+        # success
+        if abs(forward_err) < 0.45 and abs(lateral_err) < 0.30 and abs(yaw_err) < 8.0 and sp < 0.20:
             vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0))
             return True
 
-        # if yaw drift becomes large, stop pushing in
+        # if yaw drift becomes too large, brake and let it settle
         if abs(yaw_err) > 15.0:
             vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=0.35))
             time.sleep(0.05)
             continue
 
-        # steering from lateral slot-axis offset, with small yaw correction
-        steer_cmd = 0.55 * lateral_err + 0.20 * math.radians(yaw_err)
-        steer = max(-0.45, min(0.45, steer_cmd))
+        # steering from lateral offset + a bit of yaw correction
+        steer_cmd = 0.65 * lateral_err + 0.25 * math.radians(yaw_err)
+        steer = max(-0.40, min(0.40, steer_cmd))
 
-        # move slowly forward along slot axis
-        if forward_err > 1.5:
-            throttle = 0.16 if sp < 1.0 else 0.0
-        elif forward_err > 0.7:
-            throttle = 0.10 if sp < 0.7 else 0.0
-        elif forward_err > 0.2:
-            throttle = 0.05 if sp < 0.4 else 0.0
+        # slow longitudinal approach
+        if forward_err > 1.0:
+            throttle = 0.10 if sp < 0.55 else 0.0
+        elif forward_err > 0.45:
+            throttle = 0.05 if sp < 0.30 else 0.0
+        elif forward_err > 0.10:
+            throttle = 0.025 if sp < 0.18 else 0.0
         else:
             throttle = 0.0
 
         brake = 0.0
-        if throttle == 0.0 and sp > 0.25:
+        if forward_err <= 0.0 and sp > 0.12:
+            brake = 0.35
+        elif throttle == 0.0 and sp > 0.15:
             brake = 0.20
 
         vehicle.apply_control(carla.VehicleControl(
@@ -690,7 +744,6 @@ def pull_in_to_slot(vehicle, slot):
     tf = vehicle.get_transform()
     print(f"[PARK] After align: pos=({tf.location.x:.2f}, {tf.location.y:.2f}), yaw={tf.rotation.yaw:.2f}")
 
-    # If align failed badly, still attempt a short correction pass by braking first
     vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0))
     time.sleep(0.4)
 
@@ -700,11 +753,15 @@ def pull_in_to_slot(vehicle, slot):
     vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0, hand_brake=True))
 
     tf = vehicle.get_transform()
-    dist = math.hypot(tf.location.x - slot["cx"], tf.location.y - slot["cy"])
-    yaw_err = abs(normalize_angle_deg(slot["yaw"] - tf.rotation.yaw))
-    forward_err, lateral_err, _ = slot_frame_errors(vehicle, slot)
 
-    if abs(forward_err) < 0.35 and abs(lateral_err) < 0.25 and yaw_err < 8.0:
+    # define target_xy BEFORE using it
+    target_xy = compute_final_parking_target(slot, stop_short_m=0.55)
+
+    dist = math.hypot(tf.location.x - target_xy[0], tf.location.y - target_xy[1])
+    yaw_err = abs(normalize_angle_deg(slot["yaw"] - tf.rotation.yaw))
+    forward_err, lateral_err, _ = slot_frame_errors(vehicle, slot, target_xy=target_xy)
+
+    if abs(forward_err) < 0.45 and abs(lateral_err) < 0.30 and yaw_err < 8.0:
         print("[PARK] Parked ✓")
     else:
         print("[PARK] Parking inaccurate")
@@ -713,7 +770,6 @@ def pull_in_to_slot(vehicle, slot):
     print(f"[PARK] Final slot-frame: forward_err={forward_err:.2f}, lateral_err={lateral_err:.2f}")
     print(f"[PARK] align_ok={ok_align}, enter_ok={ok_enter}")
 
-    
 # =========================
 # CONNECT TO CARLA
 # =========================
@@ -774,7 +830,6 @@ draw_label(world, ego_x, ego_y, "START", carla.Color(0, 255, 0))
 # =========================
 # BUILD FIXED SLOT SET + INITIAL GRIDS
 # =========================
-# slots_data = build_fixed_slots()
 slots_data = []
 
 def _cluster_consecutive(indices, max_gap=1):
@@ -968,9 +1023,6 @@ def refresh_semantics_and_nav():
 
     semantic_grid = result["grid"]
     road_line_bbs_cache = result["road_line_bbs"]
-
-    # rebuild slots from trusted road-line geometry every refresh
-    # slots_data = _build_slots_from_roadlines(road_line_bbs_cache)
 
     slots_data = _build_slots_from_roadlines(semantic_grid)
 
@@ -1190,9 +1242,11 @@ def process_image(image):
             cv2.drawMarker(frame, (px, py), (0, 255, 0),
                         cv2.MARKER_CROSS, 30, 3, cv2.LINE_AA)
 
-            apx, apy = world_to_pixel(slot["approach_x"], slot["approach_y"])
-            cv2.circle(frame, (apx, apy), 8, (255, 255, 0), 2)
-
+            px_pre = slot.get("pre_entry_x", slot["approach_x"])
+            py_pre = slot.get("pre_entry_y", slot["approach_y"])
+            apx, apy = world_to_pixel(px_pre, py_pre)
+            cv2.circle(frame, (apx, apy), 8, (255, 0, 255), 2)   # pink
+          
         
     # ---------------------------------
     # Draw chosen slot marker
@@ -1245,6 +1299,14 @@ def run_random_park():
             return
 
         selected_slot["slot"] = slot
+        
+        pre_x, pre_y = compute_reachable_pre_entry_point(slot, inflated_grid)
+        slot["pre_entry_x"] = pre_x
+        slot["pre_entry_y"] = pre_y
+
+        print(f"[PARK] pre-entry = ({pre_x:.2f}, {pre_y:.2f})")
+        print(f"[PARK] slot center = ({slot['cx']:.2f}, {slot['cy']:.2f})")
+
         demo_state["slot_id"] = slot["id"]
         demo_state["message"] = (
             f"Chosen slot #{slot['id']} at ({slot['cx']:.2f}, {slot['cy']:.2f}), "
@@ -1254,7 +1316,7 @@ def run_random_park():
         print(f"[SLOT] Chosen slot #{slot['id']} center=({slot['cx']:.2f}, {slot['cy']:.2f}) yaw={slot['yaw']:.1f}")
         draw_label(world, slot["cx"], slot["cy"], f"SLOT {slot['id']}", carla.Color(255, 0, 0))
         draw_label(world, slot["approach_x"], slot["approach_y"], "APPROACH", carla.Color(0, 255, 255))
-        
+
         # Open only the selected slot corridor + small holes at approach / center
         work_grid = inflated_grid.copy()
 
@@ -1265,7 +1327,13 @@ def run_random_park():
             half_width_pad=1
         )
 
-        for wx, wy in [(slot["approach_x"], slot["approach_y"]), (slot["cx"], slot["cy"])]:
+       
+        final_tx, final_ty = compute_final_parking_target(slot, stop_short_m=0.55)
+
+        for wx, wy in [
+            (slot["pre_entry_x"], slot["pre_entry_y"]),
+            (final_tx, final_ty),
+        ]:
             gx, gy = world_to_grid(wx, wy, ORIGIN_X, ORIGIN_Y)
             for dy in range(-2, 3):
                 for dx in range(-2, 3):
@@ -1283,13 +1351,13 @@ def run_random_park():
                     work_grid[sgy + dy, sgx + dx] = FREE
 
         demo_state["message"] = "Planning path…"
-        path = plan(work_grid, start_xy, (slot["approach_x"], slot["approach_y"]))
+        path = plan(work_grid, start_xy, (slot["pre_entry_x"], slot["pre_entry_y"]))
         draw_path(world, path, carla.Color(0, 200, 255))
 
         demo_state["message"] = "Driving to slot approach…"
         time.sleep(1.0)
-        follow_path(vehicle, path, (slot["approach_x"], slot["approach_y"]))
-
+        follow_path(vehicle, path, (slot["pre_entry_x"], slot["pre_entry_y"]))
+       
         demo_state["message"] = "Pulling into slot…"
         pull_in_to_slot(vehicle, slot)
 
@@ -1298,6 +1366,9 @@ def run_random_park():
         yaw_err = abs(normalize_angle_deg(slot["yaw"] - tf.rotation.yaw))
         print(f"[PARK] Final pose=({tf.location.x:.2f}, {tf.location.y:.2f}) dist={dist:.2f} yaw_err={yaw_err:.2f}")
 
+        # after 1s, remove the parking helper markers
+        time.sleep(1.0)
+        selected_slot["slot"] = None
         demo_state["phase"] = "done"
         demo_state["message"] = f"Parked in slot #{slot['id']}"
     except Exception as e:
