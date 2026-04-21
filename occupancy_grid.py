@@ -11,7 +11,7 @@ LOT_WIDTH_M = 60.0
 LOT_HEIGHT_M = 60.0
 RESOLUTION = 0.5
 
-SAVE_PATH = "/scratch/tsethi2/occupancy_grid/town05_semantic.png"
+SAVE_PATH = "/scratch/jiaweis2/occupancy_grid/town05_semantic.png"
 
 # semantic values
 OUTSIDE = 0
@@ -264,6 +264,48 @@ def mark_road_lines_high_accuracy(world, grid):
     except:
         pass
 
+def build_semantic_grid(world, include_dynamic=True, ego_actor_id=None):
+    """
+    Build the semantic occupancy grid and return it as a numpy array.
+
+    Labels:
+      OUTSIDE=0, DRIVABLE=1, STATIC_CAR=2, DYNAMIC_CAR=3, ROAD_LINE=4
+
+    Args:
+      world: CARLA world
+      include_dynamic: whether to include live vehicle actors
+      ego_actor_id: optional actor id to exclude from dynamic vehicle stamping
+    """
+    grid = np.zeros((GRID_H, GRID_W), dtype=np.uint8)
+
+    # 1) drivable / parking area
+    mark_drivable_cells(world, grid)
+
+    # 2) static parked cars / static map cars
+    mark_static_vehicles(world, grid)
+
+    # 3) live vehicle actors
+    if include_dynamic:
+        vehicles = world.get_actors().filter("vehicle.*")
+        print("Live vehicle actors:", len(vehicles))
+        for v in vehicles:
+            if ego_actor_id is not None and v.id == ego_actor_id:
+                continue
+            print(
+                v.id,
+                v.type_id,
+                v.get_location(),
+                "extent:", v.bounding_box.extent
+            )
+            rasterize_actor_bbox(grid, v, DYNAMIC_CAR)
+
+    # 4) road line overlay
+    mark_road_lines(world, grid)
+
+    # 5) higher-accuracy road-line overlay
+    mark_road_lines_high_accuracy(world, grid)
+
+    return grid
 
 # =========================
 # VISUALIZATION
@@ -310,24 +352,7 @@ def main():
 
     draw_lot_border(world, LOT_CENTER_X, LOT_CENTER_Y, LOT_WIDTH_M, LOT_HEIGHT_M)
 
-    grid = np.zeros((GRID_H, GRID_W), dtype=np.uint8)
-
-    # 1) drivable / parking area
-    mark_drivable_cells(world, grid)
-
-    # 2) static parked cars / static car meshes
-    mark_static_vehicles(world, grid)
-
-    # 3) live vehicle actors (ego or spawned cars)
-    mark_dynamic_cars(world, grid)
-
-    # 4) original road line overlay
-    mark_road_lines(world, grid)
-    
-    # 5) HIGH ACCURACY ADDITION
-    # This step ensures the individual plots show up clearly as in your reference image
-    mark_road_lines_high_accuracy(world, grid)
-
+    grid = build_semantic_grid(world, include_dynamic=True, ego_actor_id=None)
     save_grid_image(grid)
 
 
