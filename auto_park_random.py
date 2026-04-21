@@ -13,6 +13,7 @@ from flask import Flask, Response, jsonify
 # import occupancy grid function
 from occupancy_grid import (
     build_semantic_grid as build_semantic_grid_truth,
+    collect_lot_semantics,
     STATIC_CAR,
     DYNAMIC_CAR,
     ROAD_LINE,
@@ -774,7 +775,8 @@ draw_label(world, ego_x, ego_y, "START", carla.Color(0, 255, 0))
 # =========================
 # BUILD FIXED SLOT SET + INITIAL GRIDS
 # =========================
-slots_data = build_fixed_slots()
+# slots_data = build_fixed_slots()
+slots_data = []
 
 # def refresh_semantics_and_nav():
 #     global semantic_grid, nav_grid, inflated_grid, slots_data
@@ -791,15 +793,324 @@ slots_data = build_fixed_slots()
 #     inflated_grid = inflate(nav_grid, INFLATION_RADIUS_M)
 #     print(f"[GRID] Inflated occupied cells: {int(np.sum(inflated_grid != FREE))}")
 
+# def _cluster_vals(vals, tol):
+#     if not vals:
+#         return []
+#     vals = sorted(vals)
+#     groups = [[vals[0]]]
+#     for v in vals[1:]:
+#         if abs(v - np.mean(groups[-1])) <= tol:
+#             groups[-1].append(v)
+#         else:
+#             groups.append([v])
+#     return groups
+
+
+# def _build_slots_from_roadlines(road_line_bbs):
+#     """
+#     Build slot rectangles from filtered RoadLines bboxes returned by occupancy_grid.py.
+
+#     Strategy:
+#     - separate vertical-ish and horizontal-ish line boxes
+#     - cluster horizontal lines into parking rows
+#     - cluster vertical separators into x positions
+#     - neighboring vertical separators define slot width
+#     - horizontal row position defines upper/lower slot bands
+#     """
+#     vertical = []
+#     horizontal = []
+
+#     for bb in road_line_bbs:
+#         w = bb.extent.x * 2.0
+#         h = bb.extent.y * 2.0
+
+#         # long horizontal row lines
+#         if w > h * 2.0:
+#             horizontal.append(bb)
+#         # short / tall separators
+#         elif h > w * 1.2:
+#             vertical.append(bb)
+
+#     if not horizontal or not vertical:
+#         print("[SLOT] No usable road-line geometry found")
+#         return []
+
+#     # cluster horizontal row lines by y
+#     h_y_groups = _cluster_vals([bb.location.y for bb in horizontal], tol=2.0)
+#     row_y_centers = sorted(float(np.mean(g)) for g in h_y_groups)
+
+#     # cluster vertical separator x positions
+#     v_x_groups = _cluster_vals([bb.location.x for bb in vertical], tol=0.8)
+#     x_centers = sorted(float(np.mean(g)) for g in v_x_groups)
+
+#     print("[SLOT] row_y_centers:", [round(v, 2) for v in row_y_centers])
+#     print("[SLOT] x_centers:", [round(v, 2) for v in x_centers])
+
+#     slots = []
+#     slot_id = 0
+
+#     # pair neighboring horizontal row centers as [top row line, bottom row line]
+#     # For Town05 lot, each parking band has 3 horizontal lines:
+#     # top separator line, aisle center line, bottom separator line.
+#     # We treat consecutive groups around the aisle.
+#     for i in range(0, len(row_y_centers) - 2, 3):
+#         y_top = row_y_centers[i]
+#         y_mid = row_y_centers[i + 1]
+#         y_bot = row_y_centers[i + 2]
+
+#         # top side slots: between y_mid and y_top
+#         # bottom side slots: between y_bot and y_mid
+#         for j in range(len(x_centers) - 1):
+#             x_left = x_centers[j]
+#             x_right = x_centers[j + 1]
+#             width = x_right - x_left
+
+#             # ignore giant gaps / tiny gaps
+#             if width < 2.0 or width > 4.5:
+#                 continue
+
+#             # top slot
+#             gx0, gy0 = world_to_grid(x_left + 0.15, y_mid + 0.15, ORIGIN_X, ORIGIN_Y)
+#             gx1, gy1 = world_to_grid(x_right - 0.15, y_top - 0.15, ORIGIN_X, ORIGIN_Y)
+#             gx0, gx1 = sorted([gx0, gx1])
+#             gy0, gy1 = sorted([gy0, gy1])
+
+#             if in_bounds(gx0, gy0) and in_bounds(gx1, gy1):
+#                 cx, cy = grid_to_world(0.5 * (gx0 + gx1), 0.5 * (gy0 + gy1), ORIGIN_X, ORIGIN_Y)
+#                 ax, ay = grid_to_world(0.5 * (gx0 + gx1), world_to_grid(cx, y_mid - 1.0, ORIGIN_X, ORIGIN_Y)[1], ORIGIN_X, ORIGIN_Y)
+
+#                 slots.append({
+#                     "id": slot_id,
+#                     "gx0": gx0, "gx1": gx1,
+#                     "gy0": gy0, "gy1": gy1,
+#                     "cx": cx, "cy": cy,
+#                     "approach_x": cx, "approach_y": y_mid - 1.0,
+#                     "yaw": 90.0,
+#                     "occupied": False,
+#                 })
+#                 slot_id += 1
+
+#             # bottom slot
+#             gx0, gy0 = world_to_grid(x_left + 0.15, y_bot + 0.15, ORIGIN_X, ORIGIN_Y)
+#             gx1, gy1 = world_to_grid(x_right - 0.15, y_mid - 0.15, ORIGIN_X, ORIGIN_Y)
+#             gx0, gx1 = sorted([gx0, gx1])
+#             gy0, gy1 = sorted([gy0, gy1])
+
+#             if in_bounds(gx0, gy0) and in_bounds(gx1, gy1):
+#                 cx, cy = grid_to_world(0.5 * (gx0 + gx1), 0.5 * (gy0 + gy1), ORIGIN_X, ORIGIN_Y)
+
+#                 slots.append({
+#                     "id": slot_id,
+#                     "gx0": gx0, "gx1": gx1,
+#                     "gy0": gy0, "gy1": gy1,
+#                     "cx": cx, "cy": cy,
+#                     "approach_x": cx, "approach_y": y_mid + 1.0,
+#                     "yaw": -90.0,
+#                     "occupied": False,
+#                 })
+#                 slot_id += 1
+
+#     print(f"[SLOT] slots built from road lines: {len(slots)}")
+#     return slots
+
+def _cluster_consecutive(indices, max_gap=1):
+    """
+    Cluster sorted integer indices into consecutive groups.
+    """
+    if len(indices) == 0:
+        return []
+
+    groups = [[int(indices[0])]]
+    for v in indices[1:]:
+        v = int(v)
+        if v - groups[-1][-1] <= max_gap:
+            groups[-1].append(v)
+        else:
+            groups.append([v])
+    return groups
+
+
+def _build_slots_from_roadlines(semantic_grid):
+    """
+    Build slots from the display-aligned ROAD_LINE mask produced by occupancy_grid.py.
+
+    Strategy:
+    1. take ROAD_LINE mask from semantic grid
+    2. apply same display transform as occupancy_grid.py
+    3. detect the 3 aisle center lines (horizontal lines in display view)
+    4. detect vertical separator columns
+    5. create top/bottom slots between neighboring separator columns
+    """
+    road_mask = (semantic_grid == ROAD_LINE).astype(np.uint8)
+
+    # SAME display transform as occupancy_grid.py
+    road_disp = np.rot90(road_mask, k=1)
+    road_disp = np.flipud(road_disp)
+
+    # Restrict to the parking area where slots actually live.
+    # This avoids the large right-side road stripe and border lines.
+    x_min, x_max = 20, 90
+    y_min, y_max = 15, 110
+    roi = road_disp[y_min:y_max, x_min:x_max]
+
+    # ---------------------------------
+    # 1) Find aisle center rows
+    # ---------------------------------
+    row_scores = roi.sum(axis=1)
+
+    # Horizontal aisle lines are long, so they create strong row sums.
+    row_thresh = max(8, int(0.45 * row_scores.max()))
+    row_candidates = np.where(row_scores >= row_thresh)[0]
+    row_groups = _cluster_consecutive(row_candidates, max_gap=2)
+
+    # Keep only long-enough horizontal clusters
+    row_y_centers = []
+    for g in row_groups:
+        if len(g) >= 2:
+            row_y_centers.append(y_min + int(round(np.mean(g))))
+
+    print("[SLOT] row_y_centers:", row_y_centers)
+
+    if len(row_y_centers) < 3:
+        print("[SLOT] Not enough aisle rows detected")
+        return []
+
+    # If more than 3 are found, keep the 3 strongest by row score
+    if len(row_y_centers) > 3:
+        scored = [(yc, row_scores[yc - y_min]) for yc in row_y_centers]
+        scored.sort(key=lambda t: t[1], reverse=True)
+        row_y_centers = sorted([t[0] for t in scored[:3]])
+
+    # ---------------------------------
+    # 2) Find vertical separator columns
+    # ---------------------------------
+    vert_only = roi.copy()
+
+    # remove aisle center rows so column projection is dominated by vertical lines
+    for yc in row_y_centers:
+        rr = yc - y_min
+        r0 = max(0, rr - 2)
+        r1 = min(vert_only.shape[0], rr + 3)
+        vert_only[r0:r1, :] = 0
+
+    col_scores = vert_only.sum(axis=0)
+
+    # Vertical separators are shorter than aisle lines, but still strong
+    col_thresh = max(4, int(0.30 * col_scores.max()))
+    col_candidates = np.where(col_scores >= col_thresh)[0]
+    col_groups = _cluster_consecutive(col_candidates, max_gap=1)
+
+    x_centers = []
+    for g in col_groups:
+        if len(g) >= 1:
+            x_centers.append(x_min + int(round(np.mean(g))))
+
+    print("[SLOT] x_centers:", x_centers)
+
+    if len(x_centers) < 2:
+        print("[SLOT] Not enough separator columns detected")
+        return []
+
+    # ---------------------------------
+    # 3) Determine slot depth above/below each aisle row
+    # ---------------------------------
+    slots = []
+    slot_id = 0
+
+    for aisle_y in row_y_centers:
+        # rows with vertical-line pixels above this aisle
+        upper_rows = np.where(vert_only[:aisle_y - y_min, :].sum(axis=1) > 0)[0]
+        upper_groups = _cluster_consecutive(upper_rows, max_gap=1)
+
+        # rows with vertical-line pixels below this aisle
+        lower_rows = np.where(vert_only[aisle_y - y_min + 1:, :].sum(axis=1) > 0)[0]
+        lower_groups = _cluster_consecutive(lower_rows, max_gap=1)
+
+        if not upper_groups or not lower_groups:
+            continue
+
+        # closest cluster above aisle
+        upper = upper_groups[-1]
+        upper_y0 = y_min + upper[0]
+        upper_y1 = y_min + upper[-1]
+
+        # closest cluster below aisle
+        lower = lower_groups[0]
+        lower_y0 = y_min + (aisle_y - y_min + 1) + lower[0]
+        lower_y1 = y_min + (aisle_y - y_min + 1) + lower[-1]
+
+        for i in range(len(x_centers) - 1):
+            x0 = x_centers[i]
+            x1 = x_centers[i + 1]
+            gap = x1 - x0
+
+            # Expected slot width in display grid cells
+            if gap < 4 or gap > 9:
+                continue
+
+            # top side slot (smaller y in display grid)
+            slots.append(
+                make_slot_from_display_grid(
+                    slot_id=slot_id,
+                    dgx_center=0.5 * (x0 + x1),
+                    dgy0=upper_y0,
+                    dgy1=upper_y1,
+                    yaw_deg=-90.0,
+                    approach_dgy=aisle_y - 3,
+                    width_cells=max(3, gap - 1),
+                )
+            )
+            slot_id += 1
+
+            # bottom side slot (larger y in display grid)
+            slots.append(
+                make_slot_from_display_grid(
+                    slot_id=slot_id,
+                    dgx_center=0.5 * (x0 + x1),
+                    dgy0=lower_y0,
+                    dgy1=lower_y1,
+                    yaw_deg=90.0,
+                    approach_dgy=aisle_y + 3,
+                    width_cells=max(3, gap - 1),
+                )
+            )
+            slot_id += 1
+
+    print(f"[SLOT] slots built from road lines: {len(slots)}")
+    return slots
+
+# def refresh_semantics_and_nav():
+#     global semantic_grid, nav_grid, inflated_grid, slots_data
+
+#     print("[GRID] Building semantic grid from occupancy_grid.py ...")
+#     semantic_grid = build_semantic_grid_truth(
+#         world,
+#         include_dynamic=True,
+#         ego_actor_id=vehicle.id
+#     )
+
+#     update_slot_occupancy(semantic_grid, slots_data)
+#     n_occ = sum(1 for s in slots_data if s["occupied"])
+#     n_free = sum(1 for s in slots_data if not s["occupied"])
+#     print(f"[SLOT] total={len(slots_data)} free={n_free} occupied={n_occ}")
+
+#     nav_grid = build_nav_grid_from_semantics(semantic_grid)
+#     inflated_grid = inflate(nav_grid, INFLATION_RADIUS_M)
+#     print(f"[GRID] Inflated occupied cells: {int(np.sum(inflated_grid != FREE))}")
+
 def refresh_semantics_and_nav():
-    global semantic_grid, nav_grid, inflated_grid, slots_data
+    global semantic_grid, nav_grid, inflated_grid, slots_data, road_line_bbs_cache
 
     print("[GRID] Building semantic grid from occupancy_grid.py ...")
-    semantic_grid = build_semantic_grid_truth(
-        world,
-        include_dynamic=True,
-        ego_actor_id=vehicle.id
-    )
+    result = collect_lot_semantics(world, include_dynamic=True, ego_actor_id=vehicle.id)
+
+    semantic_grid = result["grid"]
+    road_line_bbs_cache = result["road_line_bbs"]
+
+    # rebuild slots from trusted road-line geometry every refresh
+    # slots_data = _build_slots_from_roadlines(road_line_bbs_cache)
+
+    slots_data = _build_slots_from_roadlines(semantic_grid)
 
     update_slot_occupancy(semantic_grid, slots_data)
     n_occ = sum(1 for s in slots_data if s["occupied"])
@@ -809,7 +1120,7 @@ def refresh_semantics_and_nav():
     nav_grid = build_nav_grid_from_semantics(semantic_grid)
     inflated_grid = inflate(nav_grid, INFLATION_RADIUS_M)
     print(f"[GRID] Inflated occupied cells: {int(np.sum(inflated_grid != FREE))}")
-
+    
 refresh_semantics_and_nav()
 
 # =========================

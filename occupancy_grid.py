@@ -307,6 +307,105 @@ def build_semantic_grid(world, include_dynamic=True, ego_actor_id=None):
 
     return grid
 
+def collect_lot_semantics(world, include_dynamic=True, ego_actor_id=None):
+    """
+    Source-of-truth semantic collection for the selected parking lot.
+
+    Returns a dict with:
+      - grid: semantic grid
+      - static_bbs: filtered static vehicle bounding boxes
+      - dynamic_actors: filtered live vehicle actors
+      - road_line_bbs: filtered road-line bounding boxes
+    """
+    grid = np.zeros((GRID_H, GRID_W), dtype=np.uint8)
+
+    # 1) drivable / parking area
+    mark_drivable_cells(world, grid)
+
+    # 2) static map vehicles
+    static_labels = [
+        carla.CityObjectLabel.Car,
+        carla.CityObjectLabel.Truck,
+        carla.CityObjectLabel.Bus,
+        carla.CityObjectLabel.Motorcycle,
+        carla.CityObjectLabel.Bicycle,
+    ]
+    static_bbs = []
+    for label in static_labels:
+        try:
+            bbs = world.get_level_bbs(label)
+        except Exception as e:
+            print(f"Could not query {label}: {e}")
+            bbs = []
+
+        bbs = [bb for bb in bbs if bbox_center_in_lot(bb)]
+        print(f"{label}: {len(bbs)} static boxes in/near lot")
+        static_bbs.extend(bbs)
+
+        for bb in bbs:
+            rasterize_bbox(grid, bb, STATIC_CAR)
+
+    print("Total static vehicle boxes used:", len(static_bbs))
+
+    # 3) live vehicle actors
+    dynamic_actors = []
+    if include_dynamic:
+        vehicles = world.get_actors().filter("vehicle.*")
+        print("Live vehicle actors:", len(vehicles))
+        for v in vehicles:
+            if ego_actor_id is not None and v.id == ego_actor_id:
+                continue
+            print(
+                v.id,
+                v.type_id,
+                v.get_location(),
+                "extent:", v.bounding_box.extent
+            )
+            dynamic_actors.append(v)
+            rasterize_actor_bbox(grid, v, DYNAMIC_CAR)
+
+    # 4) road lines
+    try:
+        road_line_bbs = world.get_level_bbs(carla.CityObjectLabel.RoadLines)
+    except Exception as e:
+        print("Could not query road line bounding boxes:", e)
+        road_line_bbs = []
+
+    road_line_bbs = [bb for bb in road_line_bbs if bbox_center_in_lot(bb)]
+    print("Road line bounding boxes:", len(road_line_bbs))
+
+    # keep the same road-line behavior as the trusted script
+    for bb in road_line_bbs:
+        temp = np.zeros_like(grid)
+        rasterize_bbox(temp, bb, ROAD_LINE)
+        mask = (temp == ROAD_LINE) & (grid == DRIVABLE)
+        grid[mask] = ROAD_LINE
+
+    # high-accuracy pass
+    try:
+        for bb in road_line_bbs:
+            rasterize_bbox(grid, bb, ROAD_LINE)
+
+            ext = bb.extent
+            if 4.0 < max(ext.x, ext.y) * 2 < 6.0:
+                tf = carla.Transform(bb.location, bb.rotation)
+                slot_loc = bb.location + carla.Location(
+                    x=tf.get_right_vector().x * 1.5,
+                    y=tf.get_right_vector().y * 1.5
+                )
+                r, c = world_to_grid(slot_loc.x, slot_loc.y)
+                if in_grid(r, c):
+                    grid[r, c] = ROAD_LINE
+    except Exception:
+        pass
+
+    return {
+        "grid": grid,
+        "static_bbs": static_bbs,
+        "dynamic_actors": dynamic_actors,
+        "road_line_bbs": road_line_bbs,
+    }
+
 # =========================
 # VISUALIZATION
 # =========================
@@ -352,7 +451,9 @@ def main():
 
     draw_lot_border(world, LOT_CENTER_X, LOT_CENTER_Y, LOT_WIDTH_M, LOT_HEIGHT_M)
 
-    grid = build_semantic_grid(world, include_dynamic=True, ego_actor_id=None)
+    result = collect_lot_semantics(world, include_dynamic=True, ego_actor_id=None)
+    grid = result["grid"]
+
     save_grid_image(grid)
 
 
