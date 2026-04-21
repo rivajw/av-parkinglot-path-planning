@@ -309,118 +309,6 @@ def make_slot_from_grid(slot_id, gx_center, gy0, gy1, yaw_deg, approach_gy, widt
         "occupied": False,
     }
 
-
-def display_grid_to_raw(dgx, dgy):
-    """
-    Convert display-aligned occupancy-grid coordinates back to raw-grid coordinates.
-
-    occupancy_grid.py display uses:
-        grid_vis = np.rot90(grid, k=1)
-        grid_vis = np.flipud(grid_vis)
-
-    For this square grid, that is effectively a transpose:
-        raw_gx = display_gy
-        raw_gy = display_gx
-    """
-    raw_gx = int(round(dgy))
-    raw_gy = int(round(dgx))
-    return raw_gx, raw_gy
-
-
-def make_slot_from_display_grid(slot_id, dgx_center, dgy0, dgy1, yaw_deg, approach_dgy, width_cells=5):
-    """
-    Create a slot using coordinates measured from the DISPLAY-ALIGNED occupancy image,
-    then convert them back into raw-grid coordinates for planning.
-    """
-    dgx0 = int(round(dgx_center - width_cells / 2))
-    dgx1 = int(round(dgx_center + width_cells / 2))
-
-    # Convert display-rect corners to raw-grid corners by swapping axes
-    gx0, gy0 = display_grid_to_raw(dgx0, dgy0)
-    gx1, gy1 = display_grid_to_raw(dgx1, dgy1)
-
-    gx0, gx1 = sorted([gx0, gx1])
-    gy0, gy1 = sorted([gy0, gy1])
-
-    gx0 = max(0, min(GRID_W - 1, gx0))
-    gx1 = max(0, min(GRID_W - 1, gx1))
-    gy0 = max(0, min(GRID_H - 1, gy0))
-    gy1 = max(0, min(GRID_H - 1, gy1))
-
-    cx_g = 0.5 * (gx0 + gx1)
-    cy_g = 0.5 * (gy0 + gy1)
-
-    cx, cy = grid_to_world(cx_g, cy_g, ORIGIN_X, ORIGIN_Y)
-
-    agx, agy = display_grid_to_raw(dgx_center, approach_dgy)
-    ax, ay = grid_to_world(agx, agy, ORIGIN_X, ORIGIN_Y)
-
-    return {
-        "id": slot_id,
-        "gx0": gx0,
-        "gx1": gx1,
-        "gy0": gy0,
-        "gy1": gy1,
-        "cx": cx,
-        "cy": cy,
-        "approach_x": ax,
-        "approach_y": ay,
-        "yaw": yaw_deg,
-        "occupied": False,
-    }
-
-def build_fixed_slots():
-    """
-    Fixed slot geometry measured from the DISPLAY-ALIGNED occupancy image.
-    We convert those coordinates back into raw-grid coordinates before planning.
-    """
-    slots = []
-    slot_id = 0
-
-    # These were estimated from your display-aligned occupancy screenshot
-    display_x_centers = [28, 33, 39, 46, 52, 58, 64, 70, 76, 80]
-
-    # (aisle_dgy, lower_slot_dgy0, lower_slot_dgy1, upper_slot_dgy0, upper_slot_dgy1)
-    # These are in DISPLAY-GRID coordinates
-    row_specs = [
-        (28, 17, 26, 30, 39),
-        (60, 49, 58, 62, 70),
-        (93, 82, 91, 95, 105),
-    ]
-
-    for aisle_dgy, lower0, lower1, upper0, upper1 in row_specs:
-        for dgx in display_x_centers:
-            # lower slot in display image
-            slots.append(
-                make_slot_from_display_grid(
-                    slot_id=slot_id,
-                    dgx_center=dgx,
-                    dgy0=lower0,
-                    dgy1=lower1,
-                    yaw_deg=-90.0,
-                    approach_dgy=aisle_dgy - 3,
-                    width_cells=5,
-                )
-            )
-            slot_id += 1
-
-            # upper slot in display image
-            slots.append(
-                make_slot_from_display_grid(
-                    slot_id=slot_id,
-                    dgx_center=dgx,
-                    dgy0=upper0,
-                    dgy1=upper1,
-                    yaw_deg=90.0,
-                    approach_dgy=aisle_dgy + 3,
-                    width_cells=5,
-                )
-            )
-            slot_id += 1
-
-    print(f"[SLOT] fixed slots created: {len(slots)}")
-    return slots
-
 def update_slot_occupancy(sem, slots):
     """
     Improved slot occupancy test:
@@ -632,37 +520,101 @@ def follow_path(vehicle, path, goal_xy):
         time.sleep(0.05)
 
 
-def pull_in_to_slot(vehicle, slot):
-    slot_x = slot["cx"]
-    slot_y = slot["cy"]
-    target_yaw = slot["yaw"]
+def yaw_to_unit_vec(yaw_deg):
+    r = math.radians(yaw_deg)
+    return math.cos(r), math.sin(r)
 
-    deadline = time.time() + 12.0
+def slot_frame_errors(vehicle, slot):
+    """
+    Compute ego error in the slot frame.
+
+    forward_err:
+        distance from ego center to slot center along slot axis.
+        Positive means slot center is ahead of the car along slot direction.
+
+    lateral_err:
+        signed sideways offset from slot axis.
+        Positive/negative means ego is left/right of slot axis.
+
+    yaw_err:
+        ego yaw error relative to slot yaw.
+    """
+    tf = vehicle.get_transform()
+    cx, cy, yaw = tf.location.x, tf.location.y, tf.rotation.yaw
+
+    sx, sy = slot["cx"], slot["cy"]
+    dx = sx - cx
+    dy = sy - cy
+
+    fx, fy = yaw_to_unit_vec(slot["yaw"])          # slot forward axis
+    lx, ly = -fy, fx                               # slot lateral axis
+
+    forward_err = dx * fx + dy * fy
+    lateral_err = dx * lx + dy * ly
+    yaw_err = normalize_angle_deg(slot["yaw"] - yaw)
+
+    return forward_err, lateral_err, yaw_err
+
+
+def clear_selected_slot_corridor(work_grid, slot, extra_front_cells=2, half_width_pad=1):
+    """
+    Open only the chosen slot interior plus a short corridor from aisle into the slot.
+    This lets the final parking maneuver enter the selected slot without globally
+    freeing all parking lines.
+    """
+    gx0 = slot["gx0"]
+    gx1 = slot["gx1"]
+    gy0 = slot["gy0"]
+    gy1 = slot["gy1"]
+
+    # pad sideways a little
+    gx0 = max(0, gx0 - half_width_pad)
+    gx1 = min(GRID_W - 1, gx1 + half_width_pad)
+    gy0 = max(0, gy0 - half_width_pad)
+    gy1 = min(GRID_H - 1, gy1 + half_width_pad)
+
+    # open slot interior first
+    work_grid[gy0:gy1 + 1, gx0:gx1 + 1] = FREE
+
+    # open a short corridor from aisle side toward slot mouth
+    if slot["yaw"] > 0:   # upward-facing slot in your convention
+        c0 = max(0, gy0 - extra_front_cells)
+        c1 = gy1
+        work_grid[c0:c1 + 1, gx0:gx1 + 1] = FREE
+    else:                 # downward-facing slot
+        c0 = gy0
+        c1 = min(GRID_H - 1, gy1 + extra_front_cells)
+        work_grid[c0:c1 + 1, gx0:gx1 + 1] = FREE
+
+
+def align_to_slot_yaw(vehicle, target_yaw, timeout=8.0):
+    """
+    Low-speed alignment near the aisle approach point.
+    We only care about heading here, not exact slot-center position.
+    """
+    deadline = time.time() + timeout
 
     while time.time() < deadline:
-        t = vehicle.get_transform()
-        cx, cy, yaw = t.location.x, t.location.y, t.rotation.yaw
-
-        dist = math.hypot(slot_x - cx, slot_y - cy)
-        yaw_err = normalize_angle_deg(target_yaw - yaw)
+        tf = vehicle.get_transform()
+        yaw = tf.rotation.yaw
         sp = get_speed(vehicle)
 
-        if dist < 0.30 and abs(yaw_err) < 5.0:
-            print("[PARK] Slot pose reached")
-            break
+        yaw_err = normalize_angle_deg(target_yaw - yaw)
+
+        # success: heading good enough and nearly stopped
+        if abs(yaw_err) < 6.0 and sp < 0.25:
+            vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0))
+            return True
 
         steer = max(-1.0, min(1.0, yaw_err / 20.0))
 
-        if dist > 1.0:
-            throttle = 0.16 if sp < 1.0 else 0.0
-            brake = 0.0
-        else:
-            throttle = 0.08 if sp < 0.5 else 0.0
-            brake = 0.0
-
-        if abs(yaw_err) > 20 and sp > 0.8:
+        # keep alignment slow; allow a little rolling to turn
+        if sp > 0.7:
             throttle = 0.0
-            brake = 0.2
+            brake = 0.25
+        else:
+            throttle = 0.10
+            brake = 0.0
 
         vehicle.apply_control(carla.VehicleControl(
             throttle=throttle,
@@ -671,11 +623,97 @@ def pull_in_to_slot(vehicle, slot):
         ))
         time.sleep(0.05)
 
+    vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0))
+    return False
+
+
+def drive_straight_into_slot(vehicle, slot, timeout=10.0):
+    """
+    Enter the chosen slot along the slot axis.
+    This uses slot-frame errors, not direct 'aim at slot center'.
+    """
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        tf = vehicle.get_transform()
+        sp = get_speed(vehicle)
+
+        forward_err, lateral_err, yaw_err = slot_frame_errors(vehicle, slot)
+
+        # overall center distance only for debug / final stopping
+        dist = math.hypot(tf.location.x - slot["cx"], tf.location.y - slot["cy"])
+
+        # success: centered enough and oriented enough
+        if abs(forward_err) < 0.35 and abs(lateral_err) < 0.25 and abs(yaw_err) < 8.0 and sp < 0.2:
+            vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0))
+            return True
+
+        # if yaw drift becomes large, stop pushing in
+        if abs(yaw_err) > 15.0:
+            vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=0.35))
+            time.sleep(0.05)
+            continue
+
+        # steering from lateral slot-axis offset, with small yaw correction
+        steer_cmd = 0.55 * lateral_err + 0.20 * math.radians(yaw_err)
+        steer = max(-0.45, min(0.45, steer_cmd))
+
+        # move slowly forward along slot axis
+        if forward_err > 1.5:
+            throttle = 0.16 if sp < 1.0 else 0.0
+        elif forward_err > 0.7:
+            throttle = 0.10 if sp < 0.7 else 0.0
+        elif forward_err > 0.2:
+            throttle = 0.05 if sp < 0.4 else 0.0
+        else:
+            throttle = 0.0
+
+        brake = 0.0
+        if throttle == 0.0 and sp > 0.25:
+            brake = 0.20
+
+        vehicle.apply_control(carla.VehicleControl(
+            throttle=throttle,
+            steer=steer,
+            brake=brake
+        ))
+        time.sleep(0.05)
+
+    vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0))
+    return False
+
+
+def pull_in_to_slot(vehicle, slot):
+    print("[PARK] Stage 1: align with slot yaw")
+    ok_align = align_to_slot_yaw(vehicle, slot["yaw"], timeout=8.0)
+
+    tf = vehicle.get_transform()
+    print(f"[PARK] After align: pos=({tf.location.x:.2f}, {tf.location.y:.2f}), yaw={tf.rotation.yaw:.2f}")
+
+    # If align failed badly, still attempt a short correction pass by braking first
+    vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0))
+    time.sleep(0.4)
+
+    print("[PARK] Stage 2: drive into slot along slot axis")
+    ok_enter = drive_straight_into_slot(vehicle, slot, timeout=10.0)
+
     vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0, hand_brake=True))
-    print(f"[PARK] Final yaw: {vehicle.get_transform().rotation.yaw:.2f}")
-    print("[PARK] Parked ✓")
 
+    tf = vehicle.get_transform()
+    dist = math.hypot(tf.location.x - slot["cx"], tf.location.y - slot["cy"])
+    yaw_err = abs(normalize_angle_deg(slot["yaw"] - tf.rotation.yaw))
+    forward_err, lateral_err, _ = slot_frame_errors(vehicle, slot)
 
+    if abs(forward_err) < 0.35 and abs(lateral_err) < 0.25 and yaw_err < 8.0:
+        print("[PARK] Parked ✓")
+    else:
+        print("[PARK] Parking inaccurate")
+
+    print(f"[PARK] Final pose=({tf.location.x:.2f}, {tf.location.y:.2f}) dist={dist:.2f} yaw_err={yaw_err:.2f}")
+    print(f"[PARK] Final slot-frame: forward_err={forward_err:.2f}, lateral_err={lateral_err:.2f}")
+    print(f"[PARK] align_ok={ok_align}, enter_ok={ok_enter}")
+
+    
 # =========================
 # CONNECT TO CARLA
 # =========================
@@ -755,154 +793,171 @@ def _cluster_consecutive(indices, max_gap=1):
             groups.append([v])
     return groups
 
-
 def _build_slots_from_roadlines(semantic_grid):
     """
-    Build slots from the display-aligned ROAD_LINE mask produced by occupancy_grid.py.
+    Build slots directly from the RAW semantic grid, with no display rotation/flips.
+
+    Raw-grid meaning:
+    - gx increases with world x
+    - gy increases with world y
 
     Strategy:
-    1. take ROAD_LINE mask from semantic grid
-    2. apply same display transform as occupancy_grid.py
-    3. detect the 3 aisle center lines (horizontal lines in display view)
-    4. detect vertical separator columns
-    5. create top/bottom slots between neighboring separator columns
+    1. detect horizontal parking-row lines directly in raw grid
+    2. detect vertical separator lines directly in raw grid
+    3. build left/right slots around each aisle row directly in raw-grid coordinates
     """
     road_mask = (semantic_grid == ROAD_LINE).astype(np.uint8)
 
-    # SAME display transform as occupancy_grid.py
-    road_disp = np.rot90(road_mask, k=1)
-    road_disp = np.flipud(road_disp)
+    # Restrict to the area where parking slots exist.
+    # These bounds are in RAW GRID coordinates, not display coordinates.
+    gx_min, gx_max = 15, 105
+    gy_min, gy_max = 20, 90
 
-    # Restrict to the parking area where slots actually live.
-    # This avoids the large right-side road stripe and border lines.
-    x_min, x_max = 20, 90
-    y_min, y_max = 15, 110
-    roi = road_disp[y_min:y_max, x_min:x_max]
+    roi = road_mask[gy_min:gy_max, gx_min:gx_max]
 
     # ---------------------------------
-    # 1) Find aisle center rows
+    # 1) Find aisle center lines in raw grid
+    # In raw grid, the long parking-row lines are mostly vertical in the old display,
+    # but here we work directly in gx/gy.
+    # Since slots are arranged in columns visually now, detect strong y-bands.
     # ---------------------------------
-    row_scores = roi.sum(axis=1)
-
-    # Horizontal aisle lines are long, so they create strong row sums.
+    row_scores = roi.sum(axis=0)   # sum over gy -> strength by gx
     row_thresh = max(8, int(0.45 * row_scores.max()))
     row_candidates = np.where(row_scores >= row_thresh)[0]
     row_groups = _cluster_consecutive(row_candidates, max_gap=2)
 
-    # Keep only long-enough horizontal clusters
-    row_y_centers = []
+    aisle_x_centers = []
     for g in row_groups:
         if len(g) >= 2:
-            row_y_centers.append(y_min + int(round(np.mean(g))))
+            aisle_x_centers.append(gx_min + int(round(np.mean(g))))
 
-    print("[SLOT] row_y_centers:", row_y_centers)
+    print("[SLOT] aisle_x_centers(raw):", aisle_x_centers)
 
-    if len(row_y_centers) < 3:
-        print("[SLOT] Not enough aisle rows detected")
+    if len(aisle_x_centers) < 3:
+        print("[SLOT] Not enough aisle lines detected in raw grid")
         return []
 
-    # If more than 3 are found, keep the 3 strongest by row score
-    if len(row_y_centers) > 3:
-        scored = [(yc, row_scores[yc - y_min]) for yc in row_y_centers]
+    if len(aisle_x_centers) > 3:
+        scored = [(xc, row_scores[xc - gx_min]) for xc in aisle_x_centers]
         scored.sort(key=lambda t: t[1], reverse=True)
-        row_y_centers = sorted([t[0] for t in scored[:3]])
+        aisle_x_centers = sorted([t[0] for t in scored[:3]])
 
     # ---------------------------------
-    # 2) Find vertical separator columns
+    # 2) Find slot separator lines in raw grid
+    # Remove aisle columns first so projection is dominated by separators.
     # ---------------------------------
-    vert_only = roi.copy()
+    sep_only = roi.copy()
 
-    # remove aisle center rows so column projection is dominated by vertical lines
-    for yc in row_y_centers:
-        rr = yc - y_min
-        r0 = max(0, rr - 2)
-        r1 = min(vert_only.shape[0], rr + 3)
-        vert_only[r0:r1, :] = 0
+    for xc in aisle_x_centers:
+        cc = xc - gx_min
+        c0 = max(0, cc - 2)
+        c1 = min(sep_only.shape[1], cc + 3)
+        sep_only[:, c0:c1] = 0
 
-    col_scores = vert_only.sum(axis=0)
-
-    # Vertical separators are shorter than aisle lines, but still strong
+    col_scores = sep_only.sum(axis=1)   # sum over gx -> strength by gy
     col_thresh = max(4, int(0.30 * col_scores.max()))
     col_candidates = np.where(col_scores >= col_thresh)[0]
     col_groups = _cluster_consecutive(col_candidates, max_gap=1)
 
-    x_centers = []
+    y_centers = []
     for g in col_groups:
         if len(g) >= 1:
-            x_centers.append(x_min + int(round(np.mean(g))))
+            y_centers.append(gy_min + int(round(np.mean(g))))
 
-    print("[SLOT] x_centers:", x_centers)
+    print("[SLOT] y_centers(raw):", y_centers)
 
-    if len(x_centers) < 2:
-        print("[SLOT] Not enough separator columns detected")
+    if len(y_centers) < 2:
+        print("[SLOT] Not enough separator rows detected in raw grid")
         return []
 
     # ---------------------------------
-    # 3) Determine slot depth above/below each aisle row
+    # 3) Build slots to left/right of each aisle line
     # ---------------------------------
     slots = []
     slot_id = 0
 
-    for aisle_y in row_y_centers:
-        # rows with vertical-line pixels above this aisle
-        upper_rows = np.where(vert_only[:aisle_y - y_min, :].sum(axis=1) > 0)[0]
-        upper_groups = _cluster_consecutive(upper_rows, max_gap=1)
+    for aisle_x in aisle_x_centers:
+        # separator rows above and below this aisle region
+        upper_rows = np.where(sep_only[:, :aisle_x - gx_min].sum(axis=1) > 0)[0]
+        lower_rows = np.where(sep_only[:, aisle_x - gx_min + 1:].sum(axis=1) > 0)[0]
 
-        # rows with vertical-line pixels below this aisle
-        lower_rows = np.where(vert_only[aisle_y - y_min + 1:, :].sum(axis=1) > 0)[0]
+        upper_groups = _cluster_consecutive(upper_rows, max_gap=1)
         lower_groups = _cluster_consecutive(lower_rows, max_gap=1)
 
         if not upper_groups or not lower_groups:
             continue
 
-        # closest cluster above aisle
-        upper = upper_groups[-1]
-        upper_y0 = y_min + upper[0]
-        upper_y1 = y_min + upper[-1]
+        # But slot boundaries are really defined by neighboring y separator groups.
+        # We use all y centers as slot boundaries and build one slot per gap.
+        for i in range(len(y_centers) - 1):
+            y0 = y_centers[i]
+            y1 = y_centers[i + 1]
+            gap = y1 - y0
 
-        # closest cluster below aisle
-        lower = lower_groups[0]
-        lower_y0 = y_min + (aisle_y - y_min + 1) + lower[0]
-        lower_y1 = y_min + (aisle_y - y_min + 1) + lower[-1]
-
-        for i in range(len(x_centers) - 1):
-            x0 = x_centers[i]
-            x1 = x_centers[i + 1]
-            gap = x1 - x0
-
-            # Expected slot width in display grid cells
             if gap < 4 or gap > 9:
                 continue
 
-            # top side slot (smaller y in display grid)
-            slots.append(
-                make_slot_from_display_grid(
-                    slot_id=slot_id,
-                    dgx_center=0.5 * (x0 + x1),
-                    dgy0=upper_y0,
-                    dgy1=upper_y1,
-                    yaw_deg=-90.0,
-                    approach_dgy=aisle_y - 3,
-                    width_cells=max(3, gap - 1),
-                )
-            )
-            slot_id += 1
+            # left slot of aisle
+            gx0 = max(0, aisle_x - 10)
+            gx1 = max(0, aisle_x - 2)
+            gy0 = max(0, y0 + 1)
+            gy1 = min(GRID_H - 1, y1 - 1)
 
-            # bottom side slot (larger y in display grid)
-            slots.append(
-                make_slot_from_display_grid(
-                    slot_id=slot_id,
-                    dgx_center=0.5 * (x0 + x1),
-                    dgy0=lower_y0,
-                    dgy1=lower_y1,
-                    yaw_deg=90.0,
-                    approach_dgy=aisle_y + 3,
-                    width_cells=max(3, gap - 1),
-                )
-            )
-            slot_id += 1
+            if gx1 > gx0 and gy1 > gy0:
+                cx_g = 0.5 * (gx0 + gx1)
+                cy_g = 0.5 * (gy0 + gy1)
+                cx, cy = grid_to_world(cx_g, cy_g, ORIGIN_X, ORIGIN_Y)
 
-    print(f"[SLOT] slots built from road lines: {len(slots)}")
+                agx = aisle_x - 5
+                agy = cy_g
+                ax, ay = grid_to_world(agx, agy, ORIGIN_X, ORIGIN_Y)
+
+                slots.append({
+                    "id": slot_id,
+                    "gx0": gx0,
+                    "gx1": gx1,
+                    "gy0": gy0,
+                    "gy1": gy1,
+                    "cx": cx,
+                    "cy": cy,
+                    "approach_x": ax,
+                    "approach_y": ay,
+                    "yaw": 0.0,
+                    "occupied": False,
+                })
+                slot_id += 1
+
+            # right slot of aisle
+            gx0 = min(GRID_W - 1, aisle_x + 2)
+            gx1 = min(GRID_W - 1, aisle_x + 10)
+            gy0 = max(0, y0 + 1)
+            gy1 = min(GRID_H - 1, y1 - 1)
+
+            if gx1 > gx0 and gy1 > gy0:
+                cx_g = 0.5 * (gx0 + gx1)
+                cy_g = 0.5 * (gy0 + gy1)
+                cx, cy = grid_to_world(cx_g, cy_g, ORIGIN_X, ORIGIN_Y)
+
+                agx = aisle_x + 5
+                agy = cy_g
+                ax, ay = grid_to_world(agx, agy, ORIGIN_X, ORIGIN_Y)
+
+                slots.append({
+                    "id": slot_id,
+                    "gx0": gx0,
+                    "gx1": gx1,
+                    "gy0": gy0,
+                    "gy1": gy1,
+                    "cx": cx,
+                    "cy": cy,
+                    "approach_x": ax,
+                    "approach_y": ay,
+                    "yaw": 180.0,
+                    "occupied": False,
+                })
+                slot_id += 1
+
+    print(f"[SLOT] slots built from RAW road lines: {len(slots)}")
     return slots
 
 def refresh_semantics_and_nav():
@@ -1058,6 +1113,18 @@ def draw_ego_vehicle_overlay(frame, vehicle, color=(0, 0, 255), thickness=2):
     cv2.rectangle(frame, (x, y), (x + w_box, y + h_box), color, thickness)
     return frame
 
+def draw_slot_axis(frame, slot, length=20, color=(0, 255, 0), thickness=2):
+    fx, fy = yaw_to_unit_vec(slot["yaw"])
+
+    x0, y0 = slot["cx"], slot["cy"]
+    x1 = x0 + fx * 3.0
+    y1 = y0 + fy * 3.0
+
+    p0 = world_to_pixel(x0, y0)
+    p1 = world_to_pixel(x1, y1)
+
+    cv2.line(frame, p0, p1, color, thickness)
+    return frame
 
 def process_image(image):
     frame = np.frombuffer(image.raw_data, dtype=np.uint8)
@@ -1107,13 +1174,17 @@ def process_image(image):
         if slots_data:
             frame = draw_all_empty_slots_overlay(frame, slots_data, color=(255, 0, 0), alpha=0.18)
 
-
         # ---------------------------------
         # Draw selected slot (GREEN)
         # ---------------------------------
         slot = selected_slot["slot"]
         if slot is not None:
             frame = draw_slot_overlay(frame, slot, color=(0, 255, 0), alpha=0.30)
+            # draw yaw direction after delected the slot
+            frame = draw_slot_axis(frame, slot, color=(0, 255, 0), thickness=2)
+
+
+            
 
             px, py = world_to_pixel(slot["cx"], slot["cy"])
             cv2.drawMarker(frame, (px, py), (0, 255, 0),
@@ -1183,16 +1254,24 @@ def run_random_park():
         print(f"[SLOT] Chosen slot #{slot['id']} center=({slot['cx']:.2f}, {slot['cy']:.2f}) yaw={slot['yaw']:.1f}")
         draw_label(world, slot["cx"], slot["cy"], f"SLOT {slot['id']}", carla.Color(255, 0, 0))
         draw_label(world, slot["approach_x"], slot["approach_y"], "APPROACH", carla.Color(0, 255, 255))
-
-        # Make small holes around approach and final center
+        
+        # Open only the selected slot corridor + small holes at approach / center
         work_grid = inflated_grid.copy()
+
+        clear_selected_slot_corridor(
+            work_grid,
+            slot,
+            extra_front_cells=3,
+            half_width_pad=1
+        )
+
         for wx, wy in [(slot["approach_x"], slot["approach_y"]), (slot["cx"], slot["cy"])]:
             gx, gy = world_to_grid(wx, wy, ORIGIN_X, ORIGIN_Y)
             for dy in range(-2, 3):
                 for dx in range(-2, 3):
                     if in_bounds(gx + dx, gy + dy):
                         work_grid[gy + dy, gx + dx] = FREE
-
+                        
         tf = vehicle.get_transform()
         start_xy = (tf.location.x, tf.location.y)
 
