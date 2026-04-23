@@ -710,9 +710,15 @@ def drive_straight_into_slot(vehicle, slot, timeout=10.0):
         # debug distance to chosen stopping target
         dist = math.hypot(tf.location.x - target_xy[0], tf.location.y - target_xy[1])
 
-        # success
-        if abs(forward_err) < 0.45 and abs(lateral_err) < 0.30 and abs(yaw_err) < 8.0 and sp < 0.20:
+        # success — position good and either slow enough or nearly stopped
+        pos_ok = abs(forward_err) < 0.45 and abs(lateral_err) < 0.30 and abs(yaw_err) < 8.0
+        if pos_ok and sp < 0.20:
             vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0))
+            return True
+        # Fallback: position good, car is very slow — brake hard and accept
+        if pos_ok and sp < 0.50 and throttle == 0.0:
+            vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0))
+            time.sleep(0.3)
             return True
 
         # if yaw drift becomes too large, brake and let it settle
@@ -847,22 +853,27 @@ def reverse_and_turn_out(vehicle, slot, exit_y, timeout=18.0):
             return True
 
         # --- Steer blend ---
-        # Component 1: track raw reverse target (keeps car going backward cleanly)
+        # Component 1: track raw reverse target (straight back)
         angle_to_rev = math.degrees(math.atan2(rev_target_y - cy, rev_target_x - cx))
         rev_yaw      = normalize_angle_deg(yaw + 180.0)
         track_err    = normalize_angle_deg(angle_to_rev - rev_yaw)
         steer_track  = max(-1.0, min(1.0, -track_err / 35.0))
 
         # Component 2: swing toward aisle heading
-        # In reverse, a left-hand steer rotates the FRONT right → yaw increases.
-        # We want the front to swing toward aisle_yaw, so:
         steer_swing  = max(-1.0, min(1.0, yaw_err_aisle / 25.0))
 
-        # Blend: early = mostly track, once nose is clear = mostly swing
-        if nose_clear:
-            blend = 0.25   # 25% track, 75% swing
+        # Phase 1: straight-back until the car has cleared STRAIGHT_M from slot center.
+        # Phase 2: gentle swing starts, ramping from mostly-track to mostly-swing.
+        STRAIGHT_M  = half_len_m + 3.5   # straight until 3.5 m past slot mouth
+        FULL_SWING_M = half_len_m + 6.0  # full swing by 6 m past slot mouth
+        if dist_from_slot < STRAIGHT_M:
+            blend = 1.0   # pure straight back
+        elif dist_from_slot < FULL_SWING_M:
+            # linear ramp from 1.0 → 0.45 as car travels from STRAIGHT_M to FULL_SWING_M
+            t = (dist_from_slot - STRAIGHT_M) / (FULL_SWING_M - STRAIGHT_M)
+            blend = 1.0 - t * 0.55   # blend 1.0→0.45
         else:
-            blend = 0.65   # 65% track, 35% swing
+            blend = 0.45  # 45% track, 55% swing — gentler than before
 
         steer = blend * steer_track + (1.0 - blend) * steer_swing
         steer = max(-0.9, min(0.9, steer))
@@ -1054,6 +1065,130 @@ def _cluster_consecutive(indices, max_gap=1):
             groups.append([v])
     return groups
 
+def _infer_slot_yaw(gx0, gx1, gy0, gy1, aisle_x, side):
+    """
+    Infer the correct parking yaw from the slot rectangle geometry.
+
+    The slot rectangle tells us which direction a car enters from:
+      - Wider in X (width_x > width_y): the car drives in along the X axis.
+        The aisle line is on one X-side, so yaw is 0° (enter from +X) or
+        180° (enter from -X).
+      - Taller in Y (width_y >= width_x): the car drives in along the Y axis.
+        The aisle separator is horizontal, so yaw is 90° or 270°.
+
+    When the geometry is truly square or ambiguous (aspect ratio near 1.0),
+    we fall back to the aisle-side assignment (original behaviour).
+    """
+    width_x = (gx1 - gx0) * GRID_RES   # metres along X
+    width_y = (gy1 - gy0) * GRID_RES   # metres along Y
+
+    ratio = width_x / max(width_y, 0.01)
+
+    # Clear X-dominant slot: car enters from the side (original logic)
+    if ratio >= 1.25:
+        return 0.0 if side == "left" else 180.0
+
+    # Clear Y-dominant slot: car enters from top or bottom
+    if ratio <= 0.80:
+        # aisle_x is the vertical aisle line.
+        # If the slot is to the LEFT of aisle_x, the open mouth faces right (+X
+        # direction) → the car nose points toward aisle_x, i.e. yaw = 0°.
+        # But since the slot is Y-dominant the car actually drives in along Y.
+        # Determine whether the aisle (drive lane) is above or below the slot.
+        # We have no direct aisle-Y info here so we use the slot's own center
+        # relative to the lot center as a proxy:
+        slot_cy_g = 0.5 * (gy0 + gy1)
+        lot_cy_g  = GRID_H / 2.0
+        if slot_cy_g < lot_cy_g:
+            # slot is in upper half → aisle is below → car enters from bottom → yaw 270°
+            return 270.0
+        else:
+            # slot is in lower half → aisle is above → car enters from top → yaw 90°
+            return 90.0
+
+    # Ambiguous: fall back to side-based assignment
+    return 0.0 if side == "left" else 180.0
+
+
+def _validate_slot_yaw_waypoints(carla_world, slot):
+    """
+    Cross-check the detected slot yaw against the nearest CARLA waypoint
+    road direction.
+
+    CARLA waypoints know about drivable lanes.  If the nearest waypoint's
+    forward direction is closer to 90°/270° (Y-axis travel) than to
+    0°/180° (X-axis travel), the slot must be a Y-axis slot regardless of
+    what the road-line detector found.
+
+    Returns the validated yaw (possibly corrected).
+    """
+    carla_map = carla_world.get_map()
+    loc = carla.Location(x=slot["cx"], y=slot["cy"], z=0.5)
+    wp  = carla_map.get_waypoint(loc, project_to_road=True,
+                                  lane_type=carla.LaneType.Parking)
+    if wp is None:
+        wp = carla_map.get_waypoint(loc, project_to_road=True,
+                                     lane_type=carla.LaneType.Any)
+    if wp is None:
+        return slot["yaw"]
+
+    wp_yaw = wp.transform.rotation.yaw   # CARLA waypoint forward direction
+
+    # Normalise to [0, 360)
+    wp_yaw_norm = wp_yaw % 360.0
+    slot_yaw_norm = slot["yaw"] % 360.0
+
+    # Angular distance between detected slot yaw and waypoint yaw
+    diff = abs(normalize_angle_deg(wp_yaw_norm - slot_yaw_norm))
+
+    # If they agree within 45° we trust the detector
+    if diff <= 45.0:
+        return slot["yaw"]
+
+    # Disagreement — snap detected yaw to the nearest cardinal matching wp_yaw
+    # (keep the 0/180 vs 90/270 family that the waypoint belongs to)
+    wp_family = "Y" if (45 < wp_yaw_norm % 180 < 135) else "X"
+    slot_family = "Y" if (45 < slot_yaw_norm % 180 < 135) else "X"
+
+    if wp_family != slot_family:
+        # The families disagree — trust the waypoint and reassign slot yaw
+        # to the closest cardinal in the waypoint's family
+        if wp_family == "Y":
+            corrected = 90.0 if (wp_yaw_norm % 360 < 180) else 270.0
+        else:
+            corrected = 0.0 if (abs(normalize_angle_deg(wp_yaw_norm)) <= 90) else 180.0
+
+        print(f"[YAW-VALIDATE] slot {slot['id']}: detected={slot['yaw']:.0f}° "
+              f"wp={wp_yaw:.1f}° → corrected to {corrected:.0f}°")
+        return corrected
+
+    return slot["yaw"]
+
+
+def _recompute_approach(slot):
+    """
+    After the yaw is finalised, recompute approach_x/y so the pre-entry
+    point is always on the OPEN (mouth) side of the slot, not inside it.
+
+    For X-axis slots (yaw 0/180): approach is on the aisle side in X.
+    For Y-axis slots (yaw 90/270): approach is on the aisle side in Y.
+    """
+    fx, fy = yaw_to_unit_vec(slot["yaw"])
+    slot_len_x = (slot["gx1"] - slot["gx0"]) * GRID_RES
+    slot_len_y = (slot["gy1"] - slot["gy0"]) * GRID_RES
+    # half-extent along the slot entry axis
+    half_len = 0.5 * math.sqrt(
+        (fx * slot_len_x) ** 2 + (fy * slot_len_y) ** 2
+    )
+    half_len = max(half_len, 1.5)   # floor so approach is never inside slot
+
+    # The mouth is at slot_center - yaw_direction * half_len
+    # (yaw points INTO the slot, so mouth is in the -yaw direction)
+    ax = slot["cx"] - (half_len + 1.2) * fx
+    ay = slot["cy"] - (half_len + 1.2) * fy
+    return ax, ay
+
+
 def _build_slots_from_roadlines(semantic_grid):
     """
     Build slots directly from the RAW semantic grid, with no display rotation/flips.
@@ -1063,26 +1198,24 @@ def _build_slots_from_roadlines(semantic_grid):
     - gy increases with world y
 
     Strategy:
-    1. detect horizontal parking-row lines directly in raw grid
-    2. detect vertical separator lines directly in raw grid
-    3. build left/right slots around each aisle row directly in raw-grid coordinates
+    1. Detect strong vertical aisle lines (constant-gx bands with many road pixels).
+    2. Detect horizontal separator lines (constant-gy bands) after masking aisles.
+    3. Build one slot rectangle per (aisle, gap between separators) pair.
+    4. Infer slot yaw from the rectangle aspect ratio (_infer_slot_yaw).
+    5. Validate/correct that yaw against CARLA waypoint data (_validate_slot_yaw_waypoints).
+    6. Recompute the approach point to match the finalised yaw (_recompute_approach).
     """
     road_mask = (semantic_grid == ROAD_LINE).astype(np.uint8)
 
-    # Restrict to the area where parking slots exist.
-    # These bounds are in RAW GRID coordinates, not display coordinates.
     gx_min, gx_max = 15, 105
     gy_min, gy_max = 20, 90
 
     roi = road_mask[gy_min:gy_max, gx_min:gx_max]
 
     # ---------------------------------
-    # 1) Find aisle center lines in raw grid
-    # In raw grid, the long parking-row lines are mostly vertical in the old display,
-    # but here we work directly in gx/gy.
-    # Since slots are arranged in columns visually now, detect strong y-bands.
+    # 1) Find aisle center lines
     # ---------------------------------
-    row_scores = roi.sum(axis=0)   # sum over gy -> strength by gx
+    row_scores = roi.sum(axis=0)
     row_thresh = max(8, int(0.45 * row_scores.max()))
     row_candidates = np.where(row_scores >= row_thresh)[0]
     row_groups = _cluster_consecutive(row_candidates, max_gap=2)
@@ -1104,18 +1237,16 @@ def _build_slots_from_roadlines(semantic_grid):
         aisle_x_centers = sorted([t[0] for t in scored[:3]])
 
     # ---------------------------------
-    # 2) Find slot separator lines in raw grid
-    # Remove aisle columns first so projection is dominated by separators.
+    # 2) Find slot separator lines
     # ---------------------------------
     sep_only = roi.copy()
-
     for xc in aisle_x_centers:
         cc = xc - gx_min
         c0 = max(0, cc - 2)
         c1 = min(sep_only.shape[1], cc + 3)
         sep_only[:, c0:c1] = 0
 
-    col_scores = sep_only.sum(axis=1)   # sum over gx -> strength by gy
+    col_scores = sep_only.sum(axis=1)
     col_thresh = max(4, int(0.30 * col_scores.max()))
     col_candidates = np.where(col_scores >= col_thresh)[0]
     col_groups = _cluster_consecutive(col_candidates, max_gap=1)
@@ -1132,13 +1263,12 @@ def _build_slots_from_roadlines(semantic_grid):
         return []
 
     # ---------------------------------
-    # 3) Build slots to left/right of each aisle line
+    # 3) Build slot rectangles
     # ---------------------------------
     slots = []
     slot_id = 0
 
     for aisle_x in aisle_x_centers:
-        # separator rows above and below this aisle region
         upper_rows = np.where(sep_only[:, :aisle_x - gx_min].sum(axis=1) > 0)[0]
         lower_rows = np.where(sep_only[:, aisle_x - gx_min + 1:].sum(axis=1) > 0)[0]
 
@@ -1148,8 +1278,6 @@ def _build_slots_from_roadlines(semantic_grid):
         if not upper_groups or not lower_groups:
             continue
 
-        # But slot boundaries are really defined by neighboring y separator groups.
-        # We use all y centers as slot boundaries and build one slot per gap.
         for i in range(len(y_centers) - 1):
             y0 = y_centers[i]
             y1 = y_centers[i + 1]
@@ -1158,65 +1286,47 @@ def _build_slots_from_roadlines(semantic_grid):
             if gap < 4 or gap > 9:
                 continue
 
-            # left slot of aisle
-            gx0 = max(0, aisle_x - 10)
-            gx1 = max(0, aisle_x - 2)
-            gy0 = max(0, y0 + 1)
-            gy1 = min(GRID_H - 1, y1 - 1)
+            for side, gx0_raw, gx1_raw in [
+                ("left",  max(0,         aisle_x - 10), max(0,         aisle_x - 2)),
+                ("right", min(GRID_W - 1, aisle_x + 2), min(GRID_W - 1, aisle_x + 10)),
+            ]:
+                gx0 = gx0_raw
+                gx1 = gx1_raw
+                gy0 = max(0, y0 + 1)
+                gy1 = min(GRID_H - 1, y1 - 1)
 
-            if gx1 > gx0 and gy1 > gy0:
+                if gx1 <= gx0 or gy1 <= gy0:
+                    continue
+
                 cx_g = 0.5 * (gx0 + gx1)
                 cy_g = 0.5 * (gy0 + gy1)
                 cx, cy = grid_to_world(cx_g, cy_g, ORIGIN_X, ORIGIN_Y)
 
-                agx = aisle_x - 5
-                agy = cy_g
-                ax, ay = grid_to_world(agx, agy, ORIGIN_X, ORIGIN_Y)
+                # ── Step 4: aspect-ratio yaw inference ──
+                raw_yaw = _infer_slot_yaw(gx0, gx1, gy0, gy1, aisle_x, side)
 
-                slots.append({
-                    "id": slot_id,
-                    "gx0": gx0,
-                    "gx1": gx1,
-                    "gy0": gy0,
-                    "gy1": gy1,
-                    "cx": cx,
-                    "cy": cy,
+                # Provisional approach (will be recomputed after validation)
+                agx = (aisle_x - 5) if side == "left" else (aisle_x + 5)
+                ax, ay = grid_to_world(agx, cy_g, ORIGIN_X, ORIGIN_Y)
+
+                slot = {
+                    "id":         slot_id,
+                    "gx0":        gx0,
+                    "gx1":        gx1,
+                    "gy0":        gy0,
+                    "gy1":        gy1,
+                    "cx":         cx,
+                    "cy":         cy,
                     "approach_x": ax,
                     "approach_y": ay,
-                    "yaw": 0.0,
-                    "occupied": False,
-                })
+                    "yaw":        raw_yaw,
+                    "occupied":   False,
+                }
+                slots.append(slot)
                 slot_id += 1
 
-            # right slot of aisle
-            gx0 = min(GRID_W - 1, aisle_x + 2)
-            gx1 = min(GRID_W - 1, aisle_x + 10)
-            gy0 = max(0, y0 + 1)
-            gy1 = min(GRID_H - 1, y1 - 1)
-
-            if gx1 > gx0 and gy1 > gy0:
-                cx_g = 0.5 * (gx0 + gx1)
-                cy_g = 0.5 * (gy0 + gy1)
-                cx, cy = grid_to_world(cx_g, cy_g, ORIGIN_X, ORIGIN_Y)
-
-                agx = aisle_x + 5
-                agy = cy_g
-                ax, ay = grid_to_world(agx, agy, ORIGIN_X, ORIGIN_Y)
-
-                slots.append({
-                    "id": slot_id,
-                    "gx0": gx0,
-                    "gx1": gx1,
-                    "gy0": gy0,
-                    "gy1": gy1,
-                    "cx": cx,
-                    "cy": cy,
-                    "approach_x": ax,
-                    "approach_y": ay,
-                    "yaw": 180.0,
-                    "occupied": False,
-                })
-                slot_id += 1
+    # ── Step 5: waypoint validation (needs live world — deferred to caller) ──
+    # Validation is done in refresh_semantics_and_nav() after world is available.
 
     print(f"[SLOT] slots built from RAW road lines: {len(slots)}")
     return slots
@@ -1231,6 +1341,18 @@ def refresh_semantics_and_nav():
     road_line_bbs_cache = result["road_line_bbs"]
 
     slots_data = _build_slots_from_roadlines(semantic_grid)
+
+    # ── Step 5: validate yaw against CARLA waypoints ──
+    # Only correct slots where the waypoint disagrees with the detector.
+    # Do NOT touch approach_x/y for slots that pass validation — their
+    # geometry was already set correctly by the slot builder.
+    for slot in slots_data:
+        validated_yaw = _validate_slot_yaw_waypoints(world, slot)
+        if validated_yaw != slot["yaw"]:
+            slot["yaw"] = validated_yaw
+            slot["approach_x"], slot["approach_y"] = _recompute_approach(slot)
+            print(f"[YAW-FIX] Slot {slot['id']} yaw corrected → {validated_yaw:.0f}° "
+                  f"approach=({slot['approach_x']:.2f}, {slot['approach_y']:.2f})")
 
     update_slot_occupancy(semantic_grid, slots_data)
     n_occ = sum(1 for s in slots_data if s["occupied"])
@@ -1488,17 +1610,7 @@ def process_image(image):
             cv2.circle(frame, (apx, apy), 8, (255, 0, 255), 2)   # pink
           
         
-    # ---------------------------------
-    # Draw chosen slot marker
-    # ---------------------------------
-    slot = selected_slot["slot"]
-    if slot is not None:
-        px, py = world_to_pixel(slot["cx"], slot["cy"])
-        cv2.drawMarker(frame, (px, py), (0, 0, 255),
-                       cv2.MARKER_CROSS, 30, 3, cv2.LINE_AA)
-
-        apx, apy = world_to_pixel(slot["approach_x"], slot["approach_y"])
-        cv2.circle(frame, (apx, apy), 8, (255, 255, 0), 2)
+    # (slot markers drawn above inside the inflated_grid block)
 
     # ---------------------------------
     # Draw exit bullseye when navigating to exit
