@@ -295,6 +295,3 @@ After running the script, we can see
 
 *Note: here the ego vehicle is not detected since we didn't include it in the occupancy grid detection bounding box.*
 ![bounding_box](/figures/bounding_box.png)
-
-## Parking Slot Generation
-Since we 
