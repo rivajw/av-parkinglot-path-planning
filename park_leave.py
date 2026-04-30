@@ -96,7 +96,7 @@ CAM_SPAN_X = 2 * CAMERA_Z * math.tan(
 # SPAWN
 # =========================
 SPAWN_X   = -35.21
-SPAWN_Y   = -48.03
+SPAWN_Y   = -28.03
 SPAWN_YAW =  90.0
 
 # =========================
